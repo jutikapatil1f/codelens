@@ -1,0 +1,14 @@
+# frontend
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
+frontend/.env.production
+
+# backend
+backend/bin/
+backend/*.exe
+backend/.env
+
+# OS noise
+.DS_Store
+Thumbs.db

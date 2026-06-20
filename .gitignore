@@ -5,8 +5,9 @@ frontend/.env.local
 frontend/.env.production
 
 # backend
-backend/bin/
-backend/*.exe
+backend/node_modules/
+backend/dist/
+backend/coverage/
 backend/.env
 
 # OS noise

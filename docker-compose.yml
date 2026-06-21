@@ -6,7 +6,7 @@ services:
     ports:
       - "8080:8080"
     environment:
-      DATABASE_URL: postgresql://neondb_owner:npg_1epZcQrVoRC9@ep-delicate-bar-ahyiy9ur.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require
+      DATABASE_URL: postgresql://neondb_owner:npg_fnNiKdHgvB54@ep-delicate-bar-ahyiy9ur-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
       REDIS_URL: redis://redis:6379
       AI_PROVIDER: ollama
       OLLAMA_URL: http://ollama:11434

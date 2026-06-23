@@ -1,0 +1,314 @@
+// Builds a print-ready HTML report for an analysis and opens the browser's
+// print dialog (where the user picks "Save as PDF"). Kept framework-free — it
+// renders a self-contained HTML document into a hidden iframe so the print has
+// its own paged-media styling, independent of the app's CSS.
+
+import type { Finding } from "./api";
+
+export interface ReportData {
+  fileName: string;
+  language: string;
+  code: string;
+  createdAt: string;
+  author: string;
+  id: string;
+  summary?: string;
+  findings: Finding[];
+  complexity: { time: string; space: string };
+}
+
+const LANGUAGE_LABELS: Record<string, string> = {
+  typescript: "TypeScript",
+  javascript: "JavaScript",
+  python: "Python",
+  java: "Java",
+  go: "Go",
+  rust: "Rust",
+  c: "C",
+  cpp: "C++",
+  csharp: "C#",
+  ruby: "Ruby",
+  php: "PHP",
+  sql: "SQL",
+};
+const EXT: Record<string, string> = {
+  typescript: "TS",
+  javascript: "JS",
+  python: "PY",
+  java: "JV",
+  go: "GO",
+  rust: "RS",
+  c: "C",
+  cpp: "C+",
+  csharp: "C#",
+  ruby: "RB",
+  php: "PHP",
+  sql: "SQL",
+};
+
+// Per-finding presentation (badge label, fill colour, faint card tint).
+const STYLE: Record<Finding["type"], { label: string; fill: string; tint: string; line: string }> = {
+  bug: { label: "BUG", fill: "#b45309", tint: "#fdf6ec", line: "#f0d9b3" },
+  improvement: { label: "IMPROVEMENT", fill: "#2563eb", tint: "#eef3fd", line: "#cdddf8" },
+  good: { label: "LOOKS GOOD", fill: "#15803d", tint: "#edf6f0", line: "#c5e3d0" },
+};
+
+const BADGE_ICON: Record<Finding["type"], string> = {
+  bug: '<path d="M12 3l9 16H3z M12 9v4 M12 17h.01"/>',
+  improvement:
+    '<path d="M9 18h6 M10 21h4 M12 3a6 6 0 0 0-4 10c.7.7 1 1.5 1 2.5h6c0-1 .3-1.8 1-2.5A6 6 0 0 0 12 3z"/>',
+  good: '<path d="M20 6 9 17l-5-5"/>',
+};
+
+function esc(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+const KEYWORDS = new Set([
+  "function", "const", "let", "var", "return", "if", "else", "for", "while", "do",
+  "switch", "case", "break", "continue", "new", "class", "extends", "implements",
+  "interface", "type", "import", "from", "export", "default", "async", "await",
+  "try", "catch", "finally", "throw", "typeof", "instanceof", "in", "of", "void",
+  "null", "undefined", "true", "false", "this", "super", "public", "private",
+  "protected", "static", "readonly", "enum", "def", "elif", "lambda", "pass",
+  "None", "True", "False", "and", "or", "not", "func", "struct", "impl", "fn",
+  "pub", "mut", "use", "package", "self", "yield", "with", "as",
+]);
+
+// Lightweight per-line syntax colouring. Not a full parser — good enough to
+// resemble the editor for the short snippets these reports cover.
+function highlight(line: string): string {
+  const re =
+    /(\/\/.*$|#.*$|\/\*.*?\*\/)|("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|(\b\d[\d_]*(?:\.\d+)?\b)|([A-Za-z_$][\w$]*)|(\s+)|([^\s])/g;
+  let out = "";
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(line)) !== null) {
+    const [tok, comment, str, num, ident, ws, other] = m;
+    if (comment) out += `<span style="color:#6b7280;font-style:italic">${esc(comment)}</span>`;
+    else if (str) out += `<span style="color:#15803d">${esc(str)}</span>`;
+    else if (num) out += `<span style="color:#b45309">${esc(num)}</span>`;
+    else if (ident) {
+      if (KEYWORDS.has(ident)) out += `<span style="color:#7c3aed">${ident}</span>`;
+      else if (/^[A-Z]/.test(ident)) out += `<span style="color:#1d4ed8">${ident}</span>`;
+      else out += esc(ident);
+    } else if (ws) out += esc(ws);
+    else out += esc(other ?? "");
+    if (re.lastIndex === m.index) re.lastIndex++; // guard against zero-width
+  }
+  return out;
+}
+
+// Renders a message with `inline code` spans styled.
+function inlineCode(message: string): string {
+  return message
+    .split(/(`[^`]+`)/g)
+    .map((part) =>
+      part.startsWith("`") && part.endsWith("`")
+        ? `<code class="ic">${esc(part.slice(1, -1))}</code>`
+        : esc(part),
+    )
+    .join("");
+}
+
+function shareCode(id: string): string {
+  return id.replace(/[^a-z0-9]/gi, "").slice(0, 6).toLowerCase() || "report";
+}
+
+function logoSvg(): string {
+  return `<svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="#fff" stroke-width="2">
+    <circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="2.5" fill="#fff" stroke="none"/>
+    <line x1="12" y1="4" x2="12" y2="9"/><line x1="12" y1="15" x2="12" y2="20"/>
+    <line x1="4" y1="12" x2="9" y2="12"/><line x1="15" y1="12" x2="20" y2="12"/></svg>`;
+}
+
+function header(right: string): string {
+  return `<div class="hd">
+    <div class="brand"><span class="logo">${logoSvg()}</span><span class="brandname">CodeLens</span></div>
+    <span class="hd-right">${right}</span>
+  </div>`;
+}
+
+function footer(code: string, page: number): string {
+  return `<div class="ft">
+    <span>generated by CodeLens · codelens.app/s/${esc(code)}</span>
+    <span>page ${page} of 2</span>
+  </div>`;
+}
+
+function codeBlock(code: string, findings: Finding[]): string {
+  const bugLines = new Set(
+    findings.filter((f) => f.type === "bug" && f.line != null).map((f) => f.line),
+  );
+  const rows = code.split("\n").map((line, i) => {
+    const n = i + 1;
+    const active = bugLines.has(n) ? " active" : "";
+    return `<div class="cl-row${active}"><span class="cl-num">${n}</span><span class="cl-code">${highlight(line) || "&nbsp;"}</span></div>`;
+  });
+  return `<div class="code">${rows.join("")}</div>`;
+}
+
+function fixDiff(finding: Finding, codeLines: string[]): string {
+  if (!finding.fix) return "";
+  const before =
+    finding.line != null ? (codeLines[finding.line - 1] ?? "").trim() : "";
+  const after = finding.fix.trim();
+  const del = before
+    ? `<div class="d-row d-del"><span class="d-mark">−</span><span>${highlight(before)}</span></div>`
+    : "";
+  const add = `<div class="d-row d-add"><span class="d-mark">+</span><span>${highlight(after)}</span></div>`;
+  return `<div class="diff">${del}${add}</div>`;
+}
+
+function findingCard(f: Finding, codeLines: string[]): string {
+  const s = STYLE[f.type];
+  const loc =
+    (f.line != null ? `Line ${f.line}` : "") +
+    (f.line != null && f.title ? " · " : "") +
+    (f.title ? esc(f.title) : "");
+  return `<div class="card" style="background:${s.tint};border-color:${s.line}">
+    <div class="card-hd">
+      <span class="badge" style="background:${s.fill}">
+        <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${BADGE_ICON[f.type]}</svg>
+        ${s.label}
+      </span>
+      <span class="card-loc">${loc}</span>
+    </div>
+    <p class="card-msg">${inlineCode(f.message)}</p>
+    ${fixDiff(f, codeLines)}
+  </div>`;
+}
+
+export function buildReportHtml(data: ReportData): string {
+  const label = LANGUAGE_LABELS[data.language] ?? data.language;
+  const ext = EXT[data.language] ?? "··";
+  const date = (() => {
+    try {
+      return new Date(data.createdAt).toLocaleDateString("en-US", {
+        month: "long",
+        day: "numeric",
+        year: "numeric",
+      });
+    } catch {
+      return "";
+    }
+  })();
+  const code = shareCode(data.id);
+  const codeLines = data.code.split("\n");
+
+  const bugs = data.findings.filter((f) => f.type === "bug").length;
+  const improvements = data.findings.filter((f) => f.type === "improvement").length;
+  const good = data.findings.filter((f) => f.type === "good").length;
+  const lead = `CodeLens identified <strong>${data.findings.length} finding${data.findings.length === 1 ? "" : "s"}</strong> across this snippet — ${bugs} bug${bugs === 1 ? "" : "s"}, ${improvements} improvement${improvements === 1 ? "" : "s"}, and ${good} area${good === 1 ? "" : "s"} that look correct.`;
+  const summary = data.summary ? `${lead} ${esc(data.summary)}` : lead;
+
+  const tile = (lbl: string, val: string, color: string) =>
+    `<div class="tile"><div class="tile-lbl">${lbl}</div><div class="tile-val" style="color:${color}">${esc(val)}</div></div>`;
+
+  return `<!doctype html><html><head><meta charset="utf-8"><title>${esc(data.fileName)} — CodeLens</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{font-family:ui-sans-serif,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;color:#18181b;background:#fff;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  .page{width:210mm;min-height:296mm;padding:15mm 14mm 12mm;display:flex;flex-direction:column}
+  .page + .page{page-break-before:always}
+  .hd{display:flex;align-items:center;justify-content:space-between;padding-bottom:11px;border-bottom:1px solid #e5e7eb}
+  .brand{display:flex;align-items:center;gap:9px}
+  .logo{display:flex;align-items:center;justify-content:center;width:28px;height:28px;border-radius:8px;background:#2563eb}
+  .brandname{font-size:17px;font-weight:600;letter-spacing:-.01em}
+  .hd-right{font-size:13px;color:#9ca3af}
+  h1.title{margin-top:26px;font-size:26px;font-weight:700;letter-spacing:-.02em}
+  .meta{margin-top:9px;display:flex;align-items:center;gap:9px;font-size:13px;color:#52525b}
+  .meta .ts{display:inline-flex;align-items:center;justify-content:center;height:16px;padding:0 4px;border-radius:4px;background:#dbeafe;color:#1d4ed8;font-size:9px;font-weight:700}
+  .meta .dot{color:#cbd5e1}
+  .label{margin-top:22px;font-size:11px;color:#9ca3af;letter-spacing:.04em}
+  .code{margin-top:8px;border:1px solid #e5e7eb;border-radius:10px;background:#fafafa;padding:12px 4px;font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:12.5px;line-height:1.62;overflow:hidden}
+  .cl-row{display:flex;padding:0 12px;white-space:pre}
+  .cl-row.active{background:#fdf1d8}
+  .cl-num{display:inline-block;width:26px;text-align:right;margin-right:16px;color:#cbd5e1;user-select:none}
+  .cl-code{white-space:pre}
+  .summary{margin-top:8px;font-size:13.5px;line-height:1.6;color:#27272a}
+  .tiles{margin-top:16px;display:grid;grid-template-columns:repeat(4,1fr);gap:10px}
+  .tile{border:1px solid #e5e7eb;border-radius:9px;padding:11px 13px;min-height:64px}
+  .tile-lbl{font-size:11px;color:#9ca3af}
+  .tile-val{margin-top:8px;font-size:18px;font-weight:600;font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  .ft{margin-top:auto;padding-top:11px;border-top:1px solid #eee;display:flex;justify-content:space-between;font-size:11px;color:#9ca3af}
+  h2.dh{margin-top:26px;font-size:21px;font-weight:700;letter-spacing:-.01em}
+  .card{margin-top:16px;border:1px solid;border-radius:11px;padding:14px 15px}
+  .card-hd{display:flex;align-items:center;gap:10px}
+  .badge{display:inline-flex;align-items:center;gap:5px;padding:3px 9px;border-radius:6px;color:#fff;font-size:11px;font-weight:700;letter-spacing:.02em}
+  .card-loc{font-size:13.5px;font-weight:600;color:#3f3f46}
+  .card-msg{margin-top:9px;font-size:13.5px;line-height:1.6;color:#3f3f46}
+  .ic{font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:.86em;background:rgba(0,0,0,.06);padding:1px 5px;border-radius:4px}
+  .diff{margin-top:12px;border-radius:8px;background:#f3f4f6;padding:9px 12px;font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace;font-size:12.5px;line-height:1.6}
+  .d-row{display:flex;gap:8px;white-space:pre}
+  .d-mark{width:10px;font-weight:700}
+  .d-del .d-mark{color:#dc2626}
+  .d-add .d-mark{color:#16a34a}
+  @page{size:A4;margin:0}
+</style></head><body>
+  <div class="page">
+    ${header("code analysis report")}
+    <h1 class="title">${esc(data.fileName)}</h1>
+    <div class="meta">
+      <span class="ts">${ext}</span> ${esc(label)}
+      <span class="dot">·</span> ${esc(data.author)}
+      <span class="dot">·</span> ${esc(date)}
+    </div>
+    <div class="label">source code</div>
+    ${codeBlock(data.code, data.findings)}
+    <div class="label">summary</div>
+    <p class="summary">${summary}</p>
+    <div class="tiles">
+      ${tile("bugs", String(bugs), "#b45309")}
+      ${tile("improvements", String(improvements), "#2563eb")}
+      ${tile("time", data.complexity.time, "#18181b")}
+      ${tile("space", data.complexity.space, "#18181b")}
+    </div>
+    ${footer(code, 1)}
+  </div>
+  <div class="page">
+    ${header(esc(data.fileName))}
+    <h2 class="dh">Detailed findings</h2>
+    ${data.findings.map((f) => findingCard(f, codeLines)).join("")}
+    ${footer(code, 2)}
+  </div>
+</body></html>`;
+}
+
+// Renders the report into a hidden iframe and triggers the print dialog.
+export function printAnalysisReport(data: ReportData): void {
+  const html = buildReportHtml(data);
+  const iframe = document.createElement("iframe");
+  iframe.style.position = "fixed";
+  iframe.style.right = "0";
+  iframe.style.bottom = "0";
+  iframe.style.width = "0";
+  iframe.style.height = "0";
+  iframe.style.border = "0";
+  document.body.appendChild(iframe);
+
+  const doc = iframe.contentWindow?.document;
+  if (!doc) {
+    iframe.remove();
+    return;
+  }
+  doc.open();
+  doc.write(html);
+  doc.close();
+
+  const win = iframe.contentWindow;
+  if (!win) {
+    iframe.remove();
+    return;
+  }
+  // Give the iframe a tick to lay out before printing, then clean up after.
+  const run = () => {
+    win.focus();
+    win.print();
+    setTimeout(() => iframe.remove(), 1000);
+  };
+  if (doc.readyState === "complete") setTimeout(run, 150);
+  else iframe.onload = () => setTimeout(run, 150);
+}

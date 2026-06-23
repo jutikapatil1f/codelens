@@ -103,6 +103,7 @@ DATABASE_URL=postgres://dev:dev@localhost:5432/codelens
 REDIS_URL=redis://localhost:6379
 AI_PROVIDER=ollama
 OLLAMA_URL=http://localhost:11434
+OLLAMA_MODEL=qwen2.5-coder:7b
 GEMINI_API_KEY=
 JWT_SECRET=replace_with_a_long_random_secret
 PORT=8080
@@ -118,6 +119,7 @@ Never commit real API keys, database credentials, or production JWT secrets.
 | `REDIS_URL` | Redis connection string | `redis://localhost:6379` |
 | `AI_PROVIDER` | Selects the AI integration | `ollama` |
 | `OLLAMA_URL` | Ollama server address | `http://localhost:11434` |
+| `OLLAMA_MODEL` | Model the AI service runs | `qwen2.5-coder:7b` |
 | `GEMINI_API_KEY` | Credential for Gemini, when used | Leave empty for Ollama |
 | `JWT_SECRET` | Secret used to sign authentication tokens | A long random value |
 | `PORT` | Backend HTTP port | `8080` |

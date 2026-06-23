@@ -6,10 +6,11 @@ import { Analysis } from './analysis.entity';
 import { AnalysisController } from './analysis.controller';
 import { AnalysisProcessor } from './analysis.processor';
 import { AnalysisService, ANALYSIS_QUEUE } from './analysis.service';
+import { Message } from './message.entity';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Analysis]),
+    TypeOrmModule.forFeature([Analysis, Message]),
     BullModule.registerQueue({ name: ANALYSIS_QUEUE }),
   ],
   controllers: [AnalysisController],

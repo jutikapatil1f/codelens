@@ -9,10 +9,11 @@
 ## 1. What CodeLens is
 
 An AI-assisted code analysis app. A user submits a snippet of code; the backend runs it
-through a local AI model (Ollama / llama3.2) and stores a written review they can read back.
+through a local AI model (Ollama / qwen2.5-coder:7b) and stores a written review they can read back.
 
 **Stack:** NestJS 11 + TypeScript · PostgreSQL (Neon, cloud) via TypeORM · Redis + Bull
-(job queue) · Ollama (local LLM) · JWT auth. Frontend is a Next.js scaffold (not yet wired).
+(job queue) · Ollama (local LLM) · JWT auth. Frontend is Next.js + Monaco, fully wired
+(see section 7).
 
 ---
 
@@ -68,8 +69,12 @@ Each calls the next; none knows about the one before it. The service and process
 | **Analysis** | |
 | [backend/src/analysis/analysis.service.ts](backend/src/analysis/analysis.service.ts) | Saves row + enqueues job (the producer) |
 | [backend/src/analysis/analysis.processor.ts](backend/src/analysis/analysis.processor.ts) | Background worker (the consumer) |
-| [backend/src/analysis/ai.service.ts](backend/src/analysis/ai.service.ts) | Wraps the Ollama call |
+| [backend/src/analysis/ai.service.ts](backend/src/analysis/ai.service.ts) | Wraps the Ollama call (`analyzeCode` JSON review + `chat` follow-up) |
 | [backend/src/analysis/analysis.entity.ts](backend/src/analysis/analysis.entity.ts) | DB table shape for an analysis |
+| [backend/src/analysis/message.entity.ts](backend/src/analysis/message.entity.ts) | DB table for follow-up chat turns (`analysis_messages`) |
+| **Frontend** | |
+| [frontend/components/Analyzer.tsx](frontend/components/Analyzer.tsx) | The CodeLens window: editor, analysis panel, follow-up, editor integrations |
+| [frontend/lib/api.ts](frontend/lib/api.ts) | Typed API client + `parseResult` / `snippetName` helpers |
 
 ---
 
@@ -153,8 +158,8 @@ hands it to your factory, and you return the finished config (DB url, Redis host
 # 1. Infra (Redis + Ollama as Docker containers; Postgres is Neon/cloud, not here)
 docker compose up -d redis ollama
 docker exec codelens-redis-1 redis-cli ping            # → PONG
-curl -s http://localhost:11434/api/tags                # → should list llama3.2
-# (first time only) docker exec codelens-ollama-1 ollama pull llama3.2
+curl -s http://localhost:11434/api/tags                # → should list qwen2.5-coder:7b
+# (first time only) docker exec codelens-ollama-1 ollama pull qwen2.5-coder:7b
 
 # 2. Backend
 cd backend && npm run start:dev                        # wait for "Nest application successfully started"
@@ -173,8 +178,9 @@ curl -s http://localhost:8080/analyses/$ID -H "Authorization: Bearer $TOKEN"  # 
 ```
 
 **Endpoints:** `POST /auth/register`, `POST /auth/login`, `GET /auth/me` (protected) ·
-`POST /analyses`, `GET /analyses`, `GET /analyses/:id` (all protected, scoped to the owner) ·
-`GET /health`, `GET /health/db`.
+`POST /analyses`, `GET /analyses`, `GET /analyses/:id` ·
+`POST /analyses/:id/messages`, `GET /analyses/:id/messages` (follow-up chat) ·
+all `/analyses*` protected and scoped to the owner · `GET /health`, `GET /health/db`.
 
 **Note on local AI speed:** Ollama runs CPU-only here (no GPU), so each analysis takes
 30–90s and pegs the CPU, which can briefly starve the API. That's an environment limitation,
@@ -186,15 +192,67 @@ GPU or swap to the Gemini provider (`AI_PROVIDER` / `GEMINI_API_KEY` are already
 ## 6. Current state & what's NOT built yet
 
 **Done & verified:** auth (register/login/JWT) · async analysis pipeline (queue → worker → Ollama)
-· per-user persistence in Neon · health checks.
+· structured analysis output + follow-up chat (section 7) · per-user persistence in Neon ·
+full Next.js + Monaco frontend · health checks.
 
 **Not built yet:**
 - **WebSocket push** — *planned only.* No gateway, no deps installed. The README mentions it and
   `frontend/.env` has a `NEXT_PUBLIC_WS_URL` placeholder, but nothing is wired. Today the client
-  must **poll** for results.
-- **Frontend** — still the Next.js scaffold (`@monaco-editor/react` is installed; nothing wired).
+  must **poll** for analysis results.
+- **Streaming follow-up** — the `POST /messages` call is synchronous (blocks for the model's
+  30–90s). Token streaming via SSE is the natural upgrade (`AiService.chat` is the only touch-point).
+- **Share / delete snippets** — the rail's *share* button and the *ask follow-up* button's siblings
+  are present in the UI; sharing and snippet deletion have no backend yet.
 - **Hardening** — `synchronize: true` is on (dev-only; switch to migrations before prod);
   `JWT_SECRET` is still a placeholder; no rate-limiting or Bull retry/backoff config yet.
+
+---
+
+## 7. Frontend & analysis features
+
+The frontend is a single dark "CodeLens window" ([frontend/components/Analyzer.tsx](frontend/components/Analyzer.tsx)):
+a snippets rail (left), a Monaco editor (center), and an AI-analysis panel (right), over a
+bottom bar (language · model · stats · analyze).
+
+### Structured analysis output
+`AiService.analyzeCode()` asks Ollama for **strict JSON** (`format: 'json'`, `temperature: 0.2`)
+and validates it into a fixed shape, stored as a JSON string in `Analysis.result`:
+
+```jsonc
+{
+  "findings": [
+    { "type": "bug" | "improvement" | "good", "line": <1-based | null>, "message": "<one sentence>" }
+  ],
+  "complexity": { "time": "O(...)", "space": "O(...)" }
+}
+```
+
+A malformed model response degrades gracefully to one note instead of crashing the job (see
+`parseAnalysis` in [ai.service.ts](backend/src/analysis/ai.service.ts)). The client mirrors this
+with `parseResult` in [frontend/lib/api.ts](frontend/lib/api.ts), falling back to a single note for
+legacy/unstructured rows. Each finding renders as a colored card; complexity as two tiles.
+
+### Follow-up questions (chat per analysis)
+A completed analysis can be questioned further. Turns persist in the **`analysis_messages`** table
+([message.entity.ts](backend/src/analysis/message.entity.ts)). `AiService.chat()` calls Ollama's
+multi-turn `/api/chat` with a system message carrying the original code + prior analysis, then every
+past turn — so the model answers with full context. This call is **synchronous** (the request waits
+for the model), unlike the queued initial analysis.
+
+- `POST /analyses/:id/messages {content}` → saves the question, calls the model, returns `{question, answer}`.
+- `GET /analyses/:id/messages` → the thread, oldest first (loaded when a snippet is reopened).
+
+### Editor integrations
+Driven from the analysis panel via Monaco handles stored on `onMount`:
+- **Clickable findings → jump to line** — a finding with a `line` is a button (mouse + keyboard);
+  it scrolls the editor to that line, focuses it, and flashes a highlight (`.cl-flash-line`).
+- **Gutter markers** — each finding paints a colored bar in the editor gutter on its line
+  (amber = bug, blue = improvement, green = good), via decorations that re-sync on each analysis.
+  Styles live in [frontend/app/globals.css](frontend/app/globals.css) (`.cl-gutter-*`).
+- **`Cmd`/`Ctrl`+`Enter` → analyze** — bound in-editor; routed through a ref so it never calls a
+  stale handler. (Follow-up input submits on plain `Enter` via its form.)
+- **Snippet names** are derived from the first symbol in the code (`snippetName`), giving the rail
+  its `binary-search.ts`-style labels without a backend `name` column.
 
 ---
 

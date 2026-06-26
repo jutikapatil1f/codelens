@@ -1,3 +1,5 @@
+// Root module: wires global config, the Postgres connection, the Redis-backed
+// job queue (Bull), and the feature modules (auth + analysis) into one app.
 import { BullModule } from '@nestjs/bull';
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
@@ -9,20 +11,34 @@ import { AuthModule } from './auth/auth.module';
 
 @Module({
   imports: [
+    // Load .env once and make ConfigService injectable everywhere.
     ConfigModule.forRoot({ isGlobal: true }),
+    // Async so the connection URL is read from config at startup, not hardcoded.
     TypeOrmModule.forRootAsync({
       inject: [ConfigService],
-      useFactory: (config: ConfigService) => ({
-        type: 'postgres',
-        url: config.getOrThrow<string>('DATABASE_URL'),
-        autoLoadEntities: true,
-        synchronize: true, // dev only — switch to migrations before production
-        ssl: { rejectUnauthorized: false }, // required by Neon
-      }),
+      useFactory: (config: ConfigService) => {
+        const url = config.getOrThrow<string>('DATABASE_URL');
+        return {
+          type: 'postgres',
+          url,
+          autoLoadEntities: true,
+          // Auto-create the schema in dev only; production must run migrations.
+          // Set NODE_ENV=production to disable destructive auto-sync.
+          synchronize: config.get<string>('NODE_ENV') !== 'production',
+          // Enable SSL only when the connection string requests it (e.g. Neon).
+          // The bundled/local Postgres doesn't support SSL, so default to off.
+          ssl: /sslmode=require|ssl=true/.test(url)
+            ? { rejectUnauthorized: false }
+            : false,
+        };
+      },
     }),
+    // Shared queue backend for the slow AI analysis jobs (offloaded from the
+    // HTTP request path to a background worker via Redis).
     BullModule.forRootAsync({
       inject: [ConfigService],
       useFactory: (config: ConfigService) => {
+        // Bull wants host/port separately, so split the redis:// URL apart.
         const url = new URL(
           config.get<string>('REDIS_URL', 'redis://localhost:6379'),
         );

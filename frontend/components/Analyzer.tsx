@@ -22,6 +22,8 @@ import {
 import { useAuth } from "@/lib/auth-context";
 import { useTheme } from "@/lib/theme-context";
 import { printAnalysisReport } from "@/lib/report";
+import { usePresence } from "@/lib/use-presence";
+import { ShareDialog } from "@/components/ShareDialog";
 
 // Monaco touches `window`, so load it client-side only (no SSR).
 const MonacoEditor = dynamic(() => import("@monaco-editor/react"), {
@@ -177,6 +179,17 @@ function initialsFromToken(token: string | null): string {
   }
 }
 
+// The user id (JWT `sub`) — used to tell owned snippets from shared ones.
+function userIdFromToken(token: string | null): string | null {
+  if (!token) return null;
+  try {
+    const payload = JSON.parse(atob(token.split(".")[1])) as { sub?: string };
+    return payload.sub ?? null;
+  } catch {
+    return null;
+  }
+}
+
 // A friendly display name from the JWT email (e.g. "jutika.patil" → "Jutika").
 function displayNameFromToken(token: string | null): string {
   if (!token) return "You";
@@ -201,6 +214,42 @@ export function Analyzer() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [followUp, setFollowUp] = useState("");
   const [asking, setAsking] = useState(false);
+  const [sharedWithMe, setSharedWithMe] = useState<Analysis[]>([]);
+  const [shareOpen, setShareOpen] = useState(false);
+  const [hasUnsavedEdits, setHasUnsavedEdits] = useState(false);
+
+  // Applied when a collaborator pushes new content over the presence socket:
+  // sync the editor + every list that may hold this snippet, preserving our own
+  // access level (the broadcast may not carry it), and drop any local dirty flag.
+  const handleRemoteContent = useCallback((analysis: Analysis) => {
+    const mergeAccess = (item: Analysis) => ({
+      ...analysis,
+      access: analysis.access ?? item.access,
+    });
+    setCurrent((prev) => {
+      if (prev?.id !== analysis.id) return prev;
+      return mergeAccess(prev);
+    });
+    setHistory((items) =>
+      items.map((item) => (item.id === analysis.id ? mergeAccess(item) : item)),
+    );
+    setSharedWithMe((items) =>
+      items.map((item) => (item.id === analysis.id ? mergeAccess(item) : item)),
+    );
+    setCode(analysis.code);
+    setLanguage(analysis.language);
+    setHasUnsavedEdits(false);
+  }, []);
+
+  // Live "who's viewing" for the open snippet.
+  const {
+    viewers,
+    editor,
+    editMessage,
+    beginEditing,
+    stopEditing,
+    saveContent,
+  } = usePresence(token, current?.id ?? null, handleRemoteContent);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Monaco handles. Stored on mount so findings can drive the editor: jump to a
@@ -218,6 +267,11 @@ export function Analyzer() {
     } catch {
       /* non-fatal: history just won't refresh */
     }
+    try {
+      setSharedWithMe(await api.listSharedWithMe(token));
+    } catch {
+      /* non-fatal: shared list just won't refresh */
+    }
   }, [token]);
 
   useEffect(() => {
@@ -234,7 +288,11 @@ export function Analyzer() {
     };
 
     if (!token || !current) return clear();
-    if (current.status === "completed" || current.status === "failed") {
+    if (
+      current.status === "completed" ||
+      current.status === "failed" ||
+      current.status === "stale"
+    ) {
       clear();
       return;
     }
@@ -243,7 +301,11 @@ export function Analyzer() {
       try {
         const fresh = await api.getAnalysis(token, current.id);
         setCurrent(fresh);
-        if (fresh.status === "completed" || fresh.status === "failed") {
+        if (
+          fresh.status === "completed" ||
+          fresh.status === "failed" ||
+          fresh.status === "stale"
+        ) {
           clear();
           loadHistory();
         }
@@ -272,11 +334,13 @@ export function Analyzer() {
   }, [token, current?.id, current?.status]); // eslint-disable-line react-hooks/exhaustive-deps
 
   async function handleAnalyze() {
-    if (!token || !code.trim() || submitting) return;
+    if (!token || !code.trim() || submitting || !canEditSnippet) return;
     setError(null);
     setSubmitting(true);
     try {
-      const created = await api.createAnalysis(token, code, language);
+      const created = current
+        ? await api.reanalyze(token, current.id)
+        : await api.createAnalysis(token, code, language);
       setCurrent(created); // status: 'pending' — the poll effect takes over
       loadHistory();
     } catch (err) {
@@ -286,20 +350,28 @@ export function Analyzer() {
     }
   }
 
+  // Switch the open snippet from the rail. Release any editor lock we held on
+  // the previous snippet before loading the selected one into the editor.
   function openFromHistory(item: Analysis) {
+    stopEditing();
     setCurrent(item);
     setCode(item.code);
     setLanguage(item.language);
+    setHasUnsavedEdits(false);
   }
 
+  // Reset to a blank, unsaved snippet (no `current`, so analyze will create one).
   function newSnippet() {
+    stopEditing();
     setCurrent(null);
     setError(null);
     setCode("");
     setMessages([]);
     setFollowUp("");
+    setHasUnsavedEdits(false);
   }
 
+  // "Download PDF": render the completed analysis to a printable report.
   function handleShare() {
     if (!current || !structured) return;
     printAnalysisReport({
@@ -318,7 +390,7 @@ export function Analyzer() {
   async function handleFollowUp(e: React.FormEvent) {
     e.preventDefault();
     const content = followUp.trim();
-    if (!token || !current || !content || asking) return;
+    if (!token || !current || !content || asking || !canEditSnippet) return;
     setAsking(true);
     setError(null);
     // Optimistically show the question while the model thinks.
@@ -391,14 +463,94 @@ export function Analyzer() {
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () =>
       analyzeRef.current(),
     );
+    editor.onDidFocusEditorText(() => beginEditing());
     applyFindingDecorations(structured?.findings ?? []);
   };
 
+  // First local change to a saved snippet: grab the edit lock (so others see
+  // we're editing and can't take it) and flag the buffer dirty.
+  function markEditing() {
+    if (!current || !canEditSnippet || isLockedByOther) return;
+    beginEditing();
+    setHasUnsavedEdits(true);
+  }
+
+  function handleCodeChange(nextCode: string) {
+    if (isReadOnly) return;
+    setCode(nextCode);
+    if (current) markEditing();
+  }
+
+  function handleLanguageChange(nextLanguage: string) {
+    if (isReadOnly) return;
+    setLanguage(nextLanguage);
+    if (current) markEditing();
+  }
+
+  // Commit local edits: broadcast + persist via the socket, which also releases
+  // our lock so collaborators can edit next.
+  function handleSaveEdits() {
+    if (!current || !canEditSnippet || isLockedByOther || !hasUnsavedEdits) {
+      return;
+    }
+    saveContent(code, language);
+    setHasUnsavedEdits(false);
+  }
+
+  // ── derived state: identity, permissions and the editor lock ───────────────
+  // Recomputed every render from `current` + the live presence `editor`. These
+  // gate whether the editor is writable and what the footer/lock UI shows.
   const fileName = current
     ? snippetName(current.code, current.language)
     : snippetName(code, language);
   const lineCount = code ? code.split("\n").length : 0;
   const charCount = code.length;
+  const currentUserId = userIdFromToken(token);
+  const isOwner = !!current && current.userId === currentUserId;
+  const isSharedSnippet = !!current && !isOwner;
+  // Owner can always edit; a shared snippet needs explicit "edit" access. A new
+  // (unsaved) snippet is editable too.
+  const canEditSnippet = !current || isOwner || current.access === "edit";
+  // Someone *else* holds the live edit lock (we ignore our own lock here).
+  const activeOtherEditor =
+    editor && editor.userId !== currentUserId ? editor : null;
+  const isLockedByOther = !!activeOtherEditor;
+  // Read-only if we lack edit rights, or another person currently has the lock.
+  const isReadOnly = !!current && (!canEditSnippet || isLockedByOther);
+  // Most specific reason first: someone editing > view-only access > generic
+  // presence message (e.g. "X saved edits").
+  const lockMessage = activeOtherEditor
+    ? `${activeOtherEditor.name} is editing`
+    : isSharedSnippet && current?.access !== "edit"
+      ? "view-only access"
+      : editMessage;
+
+  // One entry in the left snippets rail (reused for both "mine" and "shared").
+  const renderRailItem = (item: Analysis) => {
+    const active = current?.id === item.id;
+    return (
+      <button
+        key={item.id}
+        onClick={() => openFromHistory(item)}
+        className={`flex items-center gap-2.5 rounded-lg px-2 py-2 text-left text-sm transition-colors ${
+          active
+            ? "bg-elev2 text-strong"
+            : "text-muted hover:bg-[var(--hover)] hover:text-fg"
+        }`}
+      >
+        <span
+          className={`flex h-5 w-7 shrink-0 items-center justify-center rounded text-[9px] font-bold ${
+            LANG_BADGE[item.language] ?? "bg-elev2 text-fg"
+          }`}
+        >
+          {EXT[item.language] ?? "··"}
+        </span>
+        <span className="truncate">
+          {snippetName(item.code, item.language).replace(/\.\w+$/, "")}
+        </span>
+      </button>
+    );
+  };
 
   return (
     <div className="flex h-[88dvh] max-h-[860px] min-h-[560px] w-full max-w-[1180px] flex-col overflow-hidden rounded-2xl border border-line bg-surface text-fg shadow-[0_30px_80px_-20px_rgba(0,0,0,0.6)]">
@@ -424,14 +576,41 @@ export function Analyzer() {
               className="h-4 w-4"
             />
           </button>
+          {/* Stacked avatars of everyone live on this snippet (first 3 + overflow). */}
+          {viewers.length > 0 && (
+            <div className="flex -space-x-1.5" title="Viewing now">
+              {viewers.slice(0, 3).map((v) => (
+                <span
+                  key={v.userId}
+                  title={`${v.name} is viewing`}
+                  className="flex h-7 w-7 items-center justify-center rounded-full border-2 border-surface bg-emerald-600 text-[10px] font-semibold text-white"
+                >
+                  {v.name.charAt(0).toUpperCase()}
+                </span>
+              ))}
+              {viewers.length > 3 && (
+                <span className="flex h-7 w-7 items-center justify-center rounded-full border-2 border-surface bg-elev2 text-[10px] font-semibold text-fg">
+                  +{viewers.length - 3}
+                </span>
+              )}
+            </div>
+          )}
+          <button
+            onClick={() => setShareOpen((o) => !o)}
+            disabled={!current}
+            title={current ? "Collaborate on this snippet" : "Run an analysis first"}
+            className="flex items-center gap-1.5 rounded-lg border border-blue-300/40 bg-gradient-to-r from-blue-600 via-indigo-600 to-violet-600 px-3 py-1.5 text-xs font-semibold text-white shadow-[0_8px_24px_-10px_rgba(79,70,229,0.85)] transition-all hover:-translate-y-0.5 hover:from-blue-500 hover:via-indigo-500 hover:to-violet-500 hover:shadow-[0_12px_30px_-12px_rgba(79,70,229,0.95)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400/70 disabled:translate-y-0 disabled:border-line disabled:bg-none disabled:bg-elev disabled:text-muted disabled:shadow-none disabled:opacity-60"
+          >
+            <Icon path={ICONS.share} className="h-3.5 w-3.5" />
+            Collaborate
+          </button>
           <button
             onClick={handleShare}
             disabled={!structured}
-            title={structured ? "Download PDF report" : "Run an analysis first"}
+            title={structured ? "Download PDF report" : "Run analysis first"}
             className="flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1.5 text-xs font-medium text-fg transition-colors hover:bg-[var(--hover)] disabled:opacity-50"
           >
-            <Icon path={ICONS.share} className="h-3.5 w-3.5" />
-            share
+            Download PDF
           </button>
           <button
             onClick={logout}
@@ -442,6 +621,16 @@ export function Analyzer() {
           </button>
         </div>
       </header>
+      {/* Collaborate modal — only meaningful once a snippet exists to share. */}
+      {shareOpen && current && (
+        <ShareDialog
+          token={token ?? ""}
+          analysisId={current.id}
+          isOwner={isOwner}
+          viewers={viewers}
+          onClose={() => setShareOpen(false)}
+        />
+      )}
 
       {/* ── body: rail · editor · analysis ──────────────────────── */}
       <div className="flex min-h-0 flex-1">
@@ -463,31 +652,16 @@ export function Analyzer() {
             {history.length === 0 ? (
               <p className="px-2 py-3 text-xs text-faint">No snippets yet.</p>
             ) : (
-              history.map((item) => {
-                const active = current?.id === item.id;
-                return (
-                  <button
-                    key={item.id}
-                    onClick={() => openFromHistory(item)}
-                    className={`flex items-center gap-2.5 rounded-lg px-2 py-2 text-left text-sm transition-colors ${
-                      active
-                        ? "bg-elev2 text-strong"
-                        : "text-muted hover:bg-[var(--hover)] hover:text-fg"
-                    }`}
-                  >
-                    <span
-                      className={`flex h-5 w-7 shrink-0 items-center justify-center rounded text-[9px] font-bold ${
-                        LANG_BADGE[item.language] ?? "bg-elev2 text-fg"
-                      }`}
-                    >
-                      {EXT[item.language] ?? "··"}
-                    </span>
-                    <span className="truncate">
-                      {snippetName(item.code, item.language).replace(/\.\w+$/, "")}
-                    </span>
-                  </button>
-                );
-              })
+              history.map(renderRailItem)
+            )}
+
+            {sharedWithMe.length > 0 && (
+              <>
+                <span className="mt-4 mb-1 px-2 text-xs font-medium tracking-wide text-faint">
+                  shared with me
+                </span>
+                {sharedWithMe.map(renderRailItem)}
+              </>
             )}
           </div>
         </aside>
@@ -498,8 +672,11 @@ export function Analyzer() {
             height="100%"
             language={language}
             value={code}
-            onChange={(v) => setCode(v ?? "")}
+            onChange={(v) => {
+              handleCodeChange(v ?? "");
+            }}
             theme={theme === "dark" ? "codelens-dark" : "codelens-light"}
+            // Register the matching light/dark Monaco themes once before mount.
             beforeMount={(monaco) => {
               monaco.editor.defineTheme("codelens-dark", {
                 base: "vs-dark",
@@ -563,6 +740,14 @@ export function Analyzer() {
               guides: { indentation: false },
               contextmenu: false,
               smoothScrolling: true,
+              // Lock the buffer when we lack edit rights or another user holds
+              // the lock; the tooltip explains why.
+              readOnly: isReadOnly,
+              readOnlyMessage: {
+                value: lockMessage
+                  ? lockMessage
+                  : "You only have view access for this snippet.",
+              },
             }}
           />
         </div>
@@ -582,6 +767,7 @@ export function Analyzer() {
               busy={busy}
               findings={structured?.findings ?? null}
             />
+            {/* Follow-up Q&A thread; `asking` shows the optimistic "thinking" row. */}
             {(messages.length > 0 || asking) && (
               <div className="space-y-3 border-t border-line pt-3">
                 {messages.map((m) => (
@@ -597,7 +783,7 @@ export function Analyzer() {
             )}
           </div>
 
-          {/* complexity + follow-up */}
+          {/* complexity + follow-up — only once we have a parsed result */}
           {structured && (
             <div className="shrink-0 space-y-3 border-t border-line p-4">
               <div>
@@ -617,13 +803,15 @@ export function Analyzer() {
                 <input
                   value={followUp}
                   onChange={(e) => setFollowUp(e.target.value)}
-                  disabled={asking}
-                  placeholder="ask follow-up"
+                  disabled={asking || !canEditSnippet}
+                  placeholder={
+                    canEditSnippet ? "ask follow-up" : "edit access required"
+                  }
                   className="w-full rounded-lg border border-line bg-elev py-2.5 pl-9 pr-16 text-sm text-fg outline-none transition-colors placeholder:text-muted focus:border-blue-500/60 disabled:opacity-60"
                 />
                 <button
                   type="submit"
-                  disabled={asking || !followUp.trim()}
+                  disabled={asking || !canEditSnippet || !followUp.trim()}
                   className="absolute right-1.5 top-1.5 rounded-md bg-blue-600 px-2.5 py-1.5 text-xs font-medium text-white transition-colors hover:bg-blue-500 disabled:opacity-40"
                 >
                   {asking ? "…" : "send"}
@@ -647,8 +835,9 @@ export function Analyzer() {
             </span>
             <select
               value={language}
-              onChange={(e) => setLanguage(e.target.value)}
-              className="appearance-none rounded-lg border border-line bg-elev py-1.5 pl-11 pr-7 text-xs font-medium capitalize text-fg outline-none transition-colors hover:bg-[var(--hover)]"
+              onChange={(e) => handleLanguageChange(e.target.value)}
+              disabled={isReadOnly}
+              className="appearance-none rounded-lg border border-line bg-elev py-1.5 pl-11 pr-7 text-xs font-medium capitalize text-fg outline-none transition-colors hover:bg-[var(--hover)] disabled:opacity-60"
             >
               {LANGUAGES.map((l) => (
                 <option key={l} value={l} className="bg-surface capitalize">
@@ -666,22 +855,62 @@ export function Analyzer() {
           <span className="hidden md:inline">
             {lineCount} lines · {charCount} chars
           </span>
+          {lockMessage && (
+            <span className="hidden text-faint sm:inline">
+              {lockMessage}
+            </span>
+          )}
+          {hasUnsavedEdits && (
+            <span className="hidden text-blue-400 sm:inline">
+              unsaved edits
+            </span>
+          )}
           {error && <span className="text-red-400">{error}</span>}
         </div>
-        <button
-          onClick={handleAnalyze}
-          disabled={submitting || busy || !code.trim()}
-          className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-500 disabled:opacity-50"
-        >
-          <Icon path={ICONS.play} className="h-3.5 w-3.5" />
-          {submitting ? "submitting…" : busy ? "analyzing…" : "analyze"}
-        </button>
+        <div className="flex items-center gap-2">
+          {/* Save edits: shown only to editors; enabled only when dirty and unlocked. */}
+          {current && canEditSnippet && (
+            <button
+              onClick={handleSaveEdits}
+              disabled={!hasUnsavedEdits || isLockedByOther}
+              title={
+                hasUnsavedEdits
+                  ? "Save changes and let others edit"
+                  : "No unsaved edits"
+              }
+              className="rounded-lg border border-blue-400/40 bg-blue-500/10 px-3 py-2 text-sm font-medium text-blue-300 transition-colors hover:bg-blue-500/20 disabled:opacity-45"
+            >
+              Save edits
+            </button>
+          )}
+          <button
+            onClick={handleAnalyze}
+            disabled={submitting || busy || !canEditSnippet || !code.trim()}
+            title={
+              canEditSnippet
+                ? undefined
+                : "You need edit access to analyze changes."
+            }
+            className="flex items-center gap-2 rounded-lg bg-blue-600 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-blue-500 disabled:opacity-50"
+          >
+            <Icon path={ICONS.play} className="h-3.5 w-3.5" />
+            {submitting
+              ? "submitting…"
+              : busy
+                ? "analyzing…"
+                : current
+                  ? "reanalyze"
+                  : "analyze"}
+          </button>
+        </div>
       </footer>
     </div>
   );
 }
 
 // ── sub-components ───────────────────────────────────────────────────────────
+// Colored dot + label mirroring the analysis lifecycle: pending/processing →
+// "running", completed → "live", failed, stale → "changed", else "idle".
 function StatusPill({ status }: { status?: Analysis["status"] }) {
   if (status === "processing" || status === "pending") {
     return (
@@ -698,6 +927,13 @@ function StatusPill({ status }: { status?: Analysis["status"] }) {
       </span>
     );
   }
+  if (status === "stale") {
+    return (
+      <span className="flex items-center gap-1.5 text-xs text-blue-400">
+        <span className="h-2 w-2 rounded-full bg-blue-400" /> changed
+      </span>
+    );
+  }
   if (status === "completed") {
     return (
       <span className="flex items-center gap-1.5 text-xs text-emerald-400">
@@ -708,6 +944,9 @@ function StatusPill({ status }: { status?: Analysis["status"] }) {
   return <span className="text-xs text-faint">idle</span>;
 }
 
+// The analysis panel's main region. Picks one of several states to render:
+// empty prompt, loading skeletons, error, stale notice, no findings, or the
+// list of finding cards.
 function AnalysisBody({
   current,
   busy,
@@ -747,6 +986,14 @@ function AnalysisBody({
       </div>
     );
   }
+  if (current.status === "stale") {
+    return (
+      <p className="text-sm text-muted">
+        This snippet changed. Hit <span className="text-fg">reanalyze</span> to
+        refresh findings.
+      </p>
+    );
+  }
   if (!findings || findings.length === 0) {
     return <p className="text-sm text-muted">No findings.</p>;
   }
@@ -759,6 +1006,7 @@ function AnalysisBody({
   );
 }
 
+// A single finding, color-coded by type (bug / improvement / good).
 function FindingCard({ finding }: { finding: Finding }) {
   const style = FINDING_STYLE[finding.type];
   return (
@@ -774,6 +1022,8 @@ function FindingCard({ finding }: { finding: Finding }) {
   );
 }
 
+// One follow-up message; user messages right-aligned, AI answers left with
+// inline-code formatting.
 function ChatBubble({ message }: { message: Message }) {
   const isUser = message.role === "user";
   return (
@@ -791,6 +1041,7 @@ function ChatBubble({ message }: { message: Message }) {
   );
 }
 
+// Small labeled tile for a Big-O complexity value (time / space).
 function ComplexityTile({ label, value }: { label: string; value: string }) {
   return (
     <div className="rounded-lg border border-line bg-elev px-3 py-2">

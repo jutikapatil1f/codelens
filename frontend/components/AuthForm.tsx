@@ -7,14 +7,18 @@ import { useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import { useAuth } from "@/lib/auth-context";
 
+/** Single form that toggles between login and register via `mode`. */
 export function AuthForm() {
   const { setToken } = useAuth();
+  // `mode` decides which endpoint we hit and which copy/labels show.
   const [mode, setMode] = useState<"login" | "register">("login");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
 
+  // Email/password are validated by the inputs (required, type=email,
+  // minLength). On success the stored token flips the app to the Analyzer.
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setError(null);

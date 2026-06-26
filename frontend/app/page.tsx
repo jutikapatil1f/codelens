@@ -1,5 +1,9 @@
 "use client";
 
+// Home route. Gates the app on auth state: render nothing useful until the
+// stored token has been hydrated (`ready`), then show the Analyzer when signed
+// in or the AuthForm otherwise.
+
 import { AuthForm } from "@/components/AuthForm";
 import { Analyzer } from "@/components/Analyzer";
 import { useAuth } from "@/lib/auth-context";

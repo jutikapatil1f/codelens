@@ -1,3 +1,5 @@
+// Data-access layer for user accounts: the only place that talks to the users
+// table, so all lookups/creation (and the password-hash select rules) live here.
 import { ConflictException, Injectable } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -11,6 +13,8 @@ export class UsersService {
   ) {}
 
   async create(email: string, passwordHash: string): Promise<User> {
+    // Pre-check for a friendly 409 rather than relying on the DB unique
+    // constraint to surface as an opaque 500.
     const existing = await this.users.findOne({ where: { email } });
     if (existing) {
       throw new ConflictException('Email is already registered');

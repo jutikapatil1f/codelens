@@ -1,3 +1,5 @@
+// TypeORM entity for the `users` table — the persisted account record that
+// auth reads/writes (email + bcrypt hash + timestamps).
 import {
   Column,
   CreateDateColumn,
@@ -11,6 +13,7 @@ export class User {
   @PrimaryGeneratedColumn('uuid')
   id: string;
 
+  // Unique so the same email can't register twice (one account per address).
   @Column({ unique: true })
   email: string;
 

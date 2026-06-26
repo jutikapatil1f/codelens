@@ -10,6 +10,9 @@ backend/dist/
 backend/coverage/
 backend/.env
 
+# root (Docker Compose variable substitution — holds JWT_SECRET / DATABASE_URL)
+/.env
+
 # OS noise
 .DS_Store
 Thumbs.db

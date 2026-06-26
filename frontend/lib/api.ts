@@ -4,11 +4,18 @@
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8080";
 
-export type AnalysisStatus = "pending" | "processing" | "completed" | "failed";
+export type AnalysisStatus =
+  | "pending"
+  | "processing"
+  | "completed"
+  | "failed"
+  | "stale";
+export type ShareAccess = "owner" | "view" | "edit";
 
 export interface Analysis {
   id: string;
   userId: string;
+  access?: ShareAccess;
   language: string;
   code: string;
   status: AnalysisStatus;
@@ -54,6 +61,22 @@ export interface Message {
   role: "user" | "assistant";
   content: string;
   createdAt: string;
+}
+
+// An invite granting one email view/edit access to a snippet.
+export interface SnippetShare {
+  id: string;
+  analysisId: string;
+  invitedEmail: string;
+  access: Exclude<ShareAccess, "owner">;
+  invitedBy: string;
+  createdAt: string;
+}
+
+// A live viewer of a snippet, pushed over the presence socket.
+export interface Viewer {
+  userId: string;
+  name: string;
 }
 
 export function parseResult(raw: string | null): StructuredResult | null {
@@ -107,7 +130,7 @@ export function snippetName(code: string, language: string): string {
   const kebab = symbol
     .replace(/([a-z0-9])([A-Z])/g, "$1-$2")
     .replace(/_/g, "-")
-    .toLowerCase();``
+    .toLowerCase();
   return `${kebab}.${ext}`;
 }
 
@@ -174,6 +197,23 @@ export const api = {
       token,
     }),
 
+  updateAnalysis: (
+    token: string,
+    id: string,
+    body: { code?: string; language?: string },
+  ) =>
+    request<Analysis>(`/analyses/${id}`, {
+      method: "PATCH",
+      body,
+      token,
+    }),
+
+  reanalyze: (token: string, id: string) =>
+    request<Analysis>(`/analyses/${id}/analyze`, {
+      method: "POST",
+      token,
+    }),
+
   listAnalyses: (token: string) =>
     request<Analysis[]>("/analyses", { token }),
 
@@ -190,4 +230,42 @@ export const api = {
       `/analyses/${id}/messages`,
       { method: "POST", body: { content }, token },
     ),
+
+  // Snippets shared with the current user.
+  listSharedWithMe: (token: string) =>
+    request<Analysis[]>("/analyses/shared", { token }),
+
+  // Invite management for a snippet (owner only).
+  listShares: (token: string, id: string) =>
+    request<SnippetShare[]>(`/analyses/${id}/shares`, { token }),
+
+  addShare: (
+    token: string,
+    id: string,
+    email: string,
+    access: Exclude<ShareAccess, "owner">,
+  ) =>
+    request<SnippetShare>(`/analyses/${id}/shares`, {
+      method: "POST",
+      body: { email, access },
+      token,
+    }),
+
+  updateShare: (
+    token: string,
+    id: string,
+    shareId: string,
+    access: Exclude<ShareAccess, "owner">,
+  ) =>
+    request<SnippetShare>(`/analyses/${id}/shares/${shareId}`, {
+      method: "PATCH",
+      body: { access },
+      token,
+    }),
+
+  removeShare: (token: string, id: string, shareId: string) =>
+    request<void>(`/analyses/${id}/shares/${shareId}`, {
+      method: "DELETE",
+      token,
+    }),
 };

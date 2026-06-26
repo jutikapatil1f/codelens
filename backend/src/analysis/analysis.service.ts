@@ -1,3 +1,7 @@
+// Core business logic for analyses. Owns the Analysis/Message/Share tables and
+// is the PRODUCER side of the Bull queue: it persists a 'pending' row then
+// enqueues an 'analyze' job (consumed by AnalysisProcessor). Also handles access
+// (owner vs invited), follow-up chat, and the share allowlist.
 import { InjectQueue } from '@nestjs/bull';
 import {
   BadRequestException,
@@ -6,14 +10,18 @@ import {
 } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import type { Queue } from 'bull';
-import { Repository } from 'typeorm';
+import { In, Repository } from 'typeorm';
 import { AiService, type ChatMessage } from './ai.service';
 import { Analysis } from './analysis.entity';
 import { CreateAnalysisDto } from './dto/create-analysis.dto';
+import { UpdateAnalysisDto } from './dto/update-analysis.dto';
 import { Message } from './message.entity';
+import { ShareAccess, SnippetShare } from './snippet-share.entity';
 
 export const ANALYSIS_QUEUE = 'analysis';
 export const ANALYZE_JOB = 'analyze';
+export type AnalysisAccess = 'owner' | ShareAccess;
+export type AnalysisWithAccess = Analysis & { access: AnalysisAccess };
 
 @Injectable()
 export class AnalysisService {
@@ -22,11 +30,14 @@ export class AnalysisService {
     private readonly analyses: Repository<Analysis>,
     @InjectRepository(Message)
     private readonly messages: Repository<Message>,
+    @InjectRepository(SnippetShare)
+    private readonly shares: Repository<SnippetShare>,
     @InjectQueue(ANALYSIS_QUEUE)
     private readonly queue: Queue,
     private readonly ai: AiService,
   ) {}
 
+  // Persist a new snippet as 'pending' and queue it for the background worker.
   async create(userId: string, dto: CreateAnalysisDto): Promise<Analysis> {
     const analysis = this.analyses.create({
       userId,
@@ -56,14 +67,202 @@ export class AnalysisService {
     return analysis;
   }
 
-  // Returns the follow-up conversation for an analysis, oldest first. Throws
-  // if the analysis doesn't belong to the user (findOneForUser enforces this).
-  async listMessages(userId: string, analysisId: string): Promise<Message[]> {
-    await this.findOneForUser(userId, analysisId);
+  /**
+   * Returns an analysis if the requester may VIEW it — i.e. they own it, or
+   * their email has been invited via a snippet share. Throws NotFound (not
+   * Forbidden) when neither holds, so we don't leak which ids exist.
+   */
+  async findViewable(
+    userId: string,
+    email: string,
+    id: string,
+  ): Promise<AnalysisWithAccess> {
+    const analysis = await this.analyses.findOne({ where: { id } });
+    if (!analysis) {
+      throw new NotFoundException('Analysis not found');
+    }
+    if (analysis.userId === userId) {
+      return Object.assign(analysis, { access: 'owner' as const });
+    }
+    const share = await this.shares.findOne({
+      where: { analysisId: id, invitedEmail: email.toLowerCase() },
+    });
+    if (!share) {
+      throw new NotFoundException('Analysis not found');
+    }
+    return Object.assign(analysis, { access: share.access });
+  }
+
+  // Boolean form of findViewable, for the WebSocket gateway's room-join check.
+  async canView(userId: string, email: string, id: string): Promise<boolean> {
+    try {
+      await this.findViewable(userId, email, id);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async canEdit(userId: string, email: string, id: string): Promise<boolean> {
+    try {
+      const analysis = await this.findViewable(userId, email, id);
+      return analysis.access === 'owner' || analysis.access === 'edit';
+    } catch {
+      return false;
+    }
+  }
+
+  // Returns the follow-up conversation for an analysis, oldest first. Readable
+  // by the owner or anyone the snippet is shared with.
+  async listMessages(
+    userId: string,
+    email: string,
+    analysisId: string,
+  ): Promise<Message[]> {
+    await this.findViewable(userId, email, analysisId);
     return this.messages.find({
       where: { analysisId },
       order: { createdAt: 'ASC' },
     });
+  }
+
+  // ── Sharing (invite-only allowlist) ──────────────────────────────────────
+
+  // Snippets shared WITH this user (by their email). Newest first.
+  async findSharedWithUser(email: string): Promise<AnalysisWithAccess[]> {
+    const shares = await this.shares.find({
+      where: { invitedEmail: email.toLowerCase() },
+    });
+    const ids = shares.map((s) => s.analysisId);
+    if (ids.length === 0) return [];
+    const analyses = await this.analyses.find({
+      where: { id: In(ids) },
+      order: { createdAt: 'DESC' },
+    });
+    const accessById = new Map(shares.map((s) => [s.analysisId, s.access]));
+    return analyses.map((a) =>
+      Object.assign(a, { access: accessById.get(a.id) ?? 'view' }),
+    );
+  }
+
+  // Owner-only: the invite list for a snippet.
+  async listShares(
+    ownerId: string,
+    analysisId: string,
+  ): Promise<SnippetShare[]> {
+    await this.findOneForUser(ownerId, analysisId);
+    return this.shares.find({
+      where: { analysisId },
+      order: { createdAt: 'ASC' },
+    });
+  }
+
+  // Owner-only: invite an email. Idempotent — re-inviting returns the existing
+  // share. You can't invite yourself (you already own it).
+  async addShare(
+    owner: { id: string; email: string },
+    analysisId: string,
+    email: string,
+    access: ShareAccess = 'view',
+  ): Promise<SnippetShare> {
+    await this.findOneForUser(owner.id, analysisId);
+    const invitedEmail = email.trim().toLowerCase();
+    if (invitedEmail === owner.email.toLowerCase()) {
+      throw new BadRequestException('You already own this snippet');
+    }
+    const existing = await this.shares.findOne({
+      where: { analysisId, invitedEmail },
+    });
+    if (existing) {
+      existing.access = access;
+      return this.shares.save(existing);
+    }
+    return this.shares.save(
+      this.shares.create({
+        analysisId,
+        invitedEmail,
+        access,
+        invitedBy: owner.id,
+      }),
+    );
+  }
+
+  // Owner-only: switch an existing invite between view and edit access.
+  async updateShareAccess(
+    ownerId: string,
+    analysisId: string,
+    shareId: string,
+    access: ShareAccess,
+  ): Promise<SnippetShare> {
+    await this.findOneForUser(ownerId, analysisId);
+    const share = await this.shares.findOne({
+      where: { id: shareId, analysisId },
+    });
+    if (!share) {
+      throw new NotFoundException('Share not found');
+    }
+    share.access = access;
+    return this.shares.save(share);
+  }
+
+  // Owner-only: revoke an invite.
+  async removeShare(
+    ownerId: string,
+    analysisId: string,
+    shareId: string,
+  ): Promise<void> {
+    await this.findOneForUser(ownerId, analysisId);
+    await this.shares.delete({ id: shareId, analysisId });
+  }
+
+  async updateContent(
+    userId: string,
+    email: string,
+    analysisId: string,
+    dto: UpdateAnalysisDto,
+  ): Promise<Analysis> {
+    const analysis = await this.findViewable(userId, email, analysisId);
+    if (analysis.access !== 'owner' && analysis.access !== 'edit') {
+      throw new NotFoundException('Analysis not found');
+    }
+
+    // No-op if nothing actually changed, so we don't needlessly invalidate
+    // a good result.
+    const nextCode = dto.code ?? analysis.code;
+    const nextLanguage = dto.language ?? analysis.language;
+    if (nextCode === analysis.code && nextLanguage === analysis.language) {
+      return analysis;
+    }
+
+    // Code changed → the old review no longer matches. Mark 'stale' and drop
+    // the result/error; reanalyze must be called to refresh it.
+    analysis.code = nextCode;
+    analysis.language = nextLanguage;
+    analysis.status = 'stale';
+    analysis.result = null;
+    analysis.error = null;
+    return this.analyses.save(analysis);
+  }
+
+  async reanalyze(
+    userId: string,
+    email: string,
+    analysisId: string,
+  ): Promise<Analysis> {
+    const analysis = await this.findViewable(userId, email, analysisId);
+    if (analysis.access !== 'owner' && analysis.access !== 'edit') {
+      throw new NotFoundException('Analysis not found');
+    }
+    if (!analysis.code.trim()) {
+      throw new BadRequestException('Code is required');
+    }
+    // Reset to 'pending' and re-enqueue; the worker will overwrite result.
+    analysis.status = 'pending';
+    analysis.result = null;
+    analysis.error = null;
+    const saved = await this.analyses.save(analysis);
+    await this.queue.add(ANALYZE_JOB, { analysisId: saved.id });
+    return saved;
   }
 
   /**
@@ -73,11 +272,15 @@ export class AnalysisService {
    */
   async addMessage(
     userId: string,
+    email: string,
     analysisId: string,
     content: string,
   ): Promise<{ question: Message; answer: Message }> {
-    // Ownership check + load the seed of the conversation.
-    const analysis = await this.findOneForUser(userId, analysisId);
+    // Edit access check + load the seed of the conversation.
+    const analysis = await this.findViewable(userId, email, analysisId);
+    if (analysis.access !== 'owner' && analysis.access !== 'edit') {
+      throw new NotFoundException('Analysis not found');
+    }
     if (analysis.status !== 'completed') {
       throw new BadRequestException(
         'Wait for the analysis to finish before asking follow-up questions',

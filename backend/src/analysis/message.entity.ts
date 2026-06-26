@@ -1,3 +1,4 @@
+// The 'analysis_messages' table: turns in the follow-up chat about an analysis.
 import {
   Column,
   CreateDateColumn,

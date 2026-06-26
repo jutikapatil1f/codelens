@@ -6,12 +6,15 @@ services:
     ports:
       - "8080:8080"
     environment:
-      DATABASE_URL: postgresql://neondb_owner:npg_fnNiKdHgvB54@ep-delicate-bar-ahyiy9ur-pooler.c-3.us-east-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require
+# Defaults to the bundled `postgres` service below; override via a .env file or
+      # your shell to point at a managed DB. No secrets live in this file.
+      DATABASE_URL: ${DATABASE_URL:-postgresql://dev:dev@postgres:5432/codelens}
       REDIS_URL: redis://redis:6379
       AI_PROVIDER: ollama
       OLLAMA_URL: http://ollama:11434
       OLLAMA_MODEL: qwen2.5-coder:7b
-      JWT_SECRET: dev_secret_change_in_production
+      # Required — compose fails fast if JWT_SECRET isn't set in the environment / .env.
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in a .env file or your shell before running compose}
       PORT: "8080"
     depends_on:
       postgres:

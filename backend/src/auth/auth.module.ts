@@ -1,3 +1,5 @@
+// Wires the auth feature together: Passport/JWT setup, the strategy that
+// validates incoming tokens, and the service that issues them on login.
 import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { JwtModule } from '@nestjs/jwt';
@@ -11,12 +13,14 @@ import { JwtStrategy } from './jwt.strategy';
   imports: [
     UsersModule,
     PassportModule,
+    // Async registration so the signing secret comes from config (not source),
+    // and getOrThrow fails fast at boot if JWT_SECRET is missing.
     JwtModule.registerAsync({
       imports: [ConfigModule],
       inject: [ConfigService],
       useFactory: (config: ConfigService) => ({
         secret: config.getOrThrow<string>('JWT_SECRET'),
-        signOptions: { expiresIn: '1d' },
+        signOptions: { expiresIn: '1d' }, // tokens are valid for one day
       }),
     }),
   ],

@@ -1,3 +1,7 @@
+// App Router root layout: defines <html>/<body>, loads fonts, and wraps every
+// page in the Theme + Auth context providers. Also injects a pre-paint script
+// to set the theme before React hydrates.
+
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import "./globals.css";

@@ -1,3 +1,5 @@
+// HTTP surface for authentication: register, login, and the current-user
+// lookup. Delegates all logic to AuthService; this layer is just routing.
 import {
   Body,
   Controller,
@@ -22,11 +24,14 @@ export class AuthController {
   }
 
   @Post('login')
+  // Override Nest's default 201-for-POST: a login isn't a resource creation.
   @HttpCode(HttpStatus.OK)
   login(@Body() dto: AuthCredentialsDto) {
     return this.auth.login(dto);
   }
 
+  // Guard requires a valid JWT; the user it resolves is what we echo back,
+  // letting the frontend verify a token and fetch the logged-in identity.
   @Get('me')
   @UseGuards(JwtAuthGuard)
   me(@Request() req: { user: { id: string; email: string } }) {

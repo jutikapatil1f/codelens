@@ -1,3 +1,6 @@
+// The 'analyses' table: a submitted code snippet plus its AI review and status.
+// Central record of the feature — the queue, processor, chat, and sharing all
+// hang off it.
 import {
   Column,
   CreateDateColumn,
@@ -7,7 +10,16 @@ import {
   UpdateDateColumn,
 } from 'typeorm';
 
-export type AnalysisStatus = 'pending' | 'processing' | 'completed' | 'failed';
+// Status state machine, driven by the processor:
+//   pending -> processing -> completed | failed
+// 'stale' is set when the owner edits the code, marking the prior result void
+// until a re-analysis is requested.
+export type AnalysisStatus =
+  | 'pending'
+  | 'processing'
+  | 'completed'
+  | 'failed'
+  | 'stale';
 
 @Entity('analyses')
 export class Analysis {

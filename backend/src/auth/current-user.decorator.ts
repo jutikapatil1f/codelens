@@ -1,3 +1,5 @@
+// Param decorator that injects the authenticated user into a handler,
+// e.g. `me(@CurrentUser() user: AuthUser)` — sugar over reading request.user.
 import { createParamDecorator, ExecutionContext } from '@nestjs/common';
 
 export interface AuthUser {

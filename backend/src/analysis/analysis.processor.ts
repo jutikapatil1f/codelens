@@ -1,3 +1,5 @@
+// Bull queue consumer: picks up enqueued 'analyze' jobs and runs the slow AI
+// review off the HTTP path, writing status/result back to the analyses table.
 import { Process, Processor } from '@nestjs/bull';
 import { Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
@@ -55,7 +57,10 @@ export class AnalysisProcessor {
 
     try {
       // 3. The slow part: call the AI model. Can take tens of seconds on CPU.
-      const result = await this.ai.analyzeCode(analysis.code, analysis.language);
+      const result = await this.ai.analyzeCode(
+        analysis.code,
+        analysis.language,
+      );
       // 4. Success — store the output and clear any previous error.
       await this.analyses.update(analysisId, {
         status: 'completed',
@@ -66,7 +71,10 @@ export class AnalysisProcessor {
     } catch (err) {
       // 5. Failure — record the reason on the row so the client can see why.
       const message = err instanceof Error ? err.message : String(err);
-      await this.analyses.update(analysisId, { status: 'failed', error: message });
+      await this.analyses.update(analysisId, {
+        status: 'failed',
+        error: message,
+      });
       this.logger.error(`Analysis ${analysisId} failed: ${message}`);
       // Re-throw so Bull marks the job failed and can apply its retry policy.
       // (Without this, Bull would consider the job successfully handled.)

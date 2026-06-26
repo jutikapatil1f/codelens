@@ -607,8 +607,8 @@ export function Analyzer() {
           <button
             onClick={handleShare}
             disabled={!structured}
-            title={structured ? "Download PDF report" : "Run analysis first"}
-            className="flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1.5 text-xs font-medium text-fg transition-colors hover:bg-[var(--hover)] disabled:opacity-50"
+            title={structured ? "Download PDF report" : "Analyze to download PDF"}
+            className="flex cursor-pointer items-center gap-1.5 rounded-lg border border-line px-2.5 py-1.5 text-xs font-medium text-fg transition-colors hover:bg-[var(--hover)] disabled:cursor-not-allowed disabled:opacity-50"
           >
             Download PDF
           </button>

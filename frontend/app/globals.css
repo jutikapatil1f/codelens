@@ -53,6 +53,18 @@ body {
   font-family: var(--font-sans), Arial, Helvetica, sans-serif;
 }
 
+/* Tailwind v4 dropped the default pointer cursor on buttons — restore it for
+   all interactive buttons, and show not-allowed when they're disabled. */
+@layer base {
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+  button:disabled {
+    cursor: not-allowed;
+  }
+}
+
 /* Monaco gutter markers, one per finding, colored by type. */
 .cl-gutter {
   margin-left: 3px;

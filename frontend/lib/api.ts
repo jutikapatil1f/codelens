@@ -177,7 +177,16 @@ async function request<T>(
   return res.json() as Promise<T>;
 }
 
+// The active AI provider + model the backend is configured to use.
+export interface AiInfo {
+  provider: string;
+  model: string;
+}
+
 export const api = {
+  // Public client config (no auth): which AI provider/model is active.
+  getConfig: () => request<AiInfo>("/config"),
+
   register: (email: string, password: string) =>
     request<AuthResponse>("/auth/register", {
       method: "POST",

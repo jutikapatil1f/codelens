@@ -29,5 +29,7 @@ import { SnippetShare } from './snippet-share.entity';
   ],
   controllers: [AnalysisController],
   providers: [AnalysisService, AnalysisProcessor, AiService, PresenceGateway],
+  // Exported so the root health/config controller can report the active model.
+  exports: [AiService],
 })
 export class AnalysisModule {}

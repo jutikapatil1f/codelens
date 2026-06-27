@@ -15,6 +15,7 @@ import {
   ApiError,
   parseResult,
   snippetName,
+  type AiInfo,
   type Analysis,
   type Finding,
   type Message,
@@ -98,6 +99,8 @@ const ICONS = {
   chevron: "M6 9l6 6 6-6",
   sun: "M12 3v2 M12 19v2 M5 5l1.5 1.5 M17.5 17.5L19 19 M3 12h2 M19 12h2 M5 19l1.5-1.5 M17.5 6.5L19 5 M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8z",
   moon: "M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z",
+  logout: "M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4 M16 17l5-5-5-5 M21 12H9",
+  edit: "M12 20h9 M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z",
 };
 
 // Per-finding visual treatment.
@@ -217,6 +220,12 @@ export function Analyzer() {
   const [sharedWithMe, setSharedWithMe] = useState<Analysis[]>([]);
   const [shareOpen, setShareOpen] = useState(false);
   const [hasUnsavedEdits, setHasUnsavedEdits] = useState(false);
+  // Editing a saved snippet is opt-in: the buffer stays read-only until the user
+  // clicks "Edit". A brand-new (unsaved) snippet is always writable.
+  const [isEditing, setIsEditing] = useState(false);
+  // The active AI provider + model, fetched from the backend so the footer
+  // reflects the real config (ollama vs gemini) instead of a hardcoded label.
+  const [aiInfo, setAiInfo] = useState<AiInfo | null>(null);
 
   // Applied when a collaborator pushes new content over the presence socket:
   // sync the editor + every list that may hold this snippet, preserving our own
@@ -239,6 +248,7 @@ export function Analyzer() {
     setCode(analysis.code);
     setLanguage(analysis.language);
     setHasUnsavedEdits(false);
+    setIsEditing(false);
   }, []);
 
   // Live "who's viewing" for the open snippet.
@@ -277,6 +287,20 @@ export function Analyzer() {
   useEffect(() => {
     loadHistory();
   }, [loadHistory]);
+
+  // Fetch the active AI provider/model once for the footer label.
+  useEffect(() => {
+    let active = true;
+    api
+      .getConfig()
+      .then((info) => active && setAiInfo(info))
+      .catch(() => {
+        /* non-fatal: the footer just falls back to a generic label */
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   // Poll the current analysis until it leaves a non-terminal state.
   useEffect(() => {
@@ -358,6 +382,7 @@ export function Analyzer() {
     setCode(item.code);
     setLanguage(item.language);
     setHasUnsavedEdits(false);
+    setIsEditing(false);
   }
 
   // Reset to a blank, unsaved snippet (no `current`, so analyze will create one).
@@ -369,6 +394,7 @@ export function Analyzer() {
     setMessages([]);
     setFollowUp("");
     setHasUnsavedEdits(false);
+    setIsEditing(false);
   }
 
   // "Download PDF": render the completed analysis to a printable report.
@@ -463,15 +489,22 @@ export function Analyzer() {
     editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.Enter, () =>
       analyzeRef.current(),
     );
-    editor.onDidFocusEditorText(() => beginEditing());
     applyFindingDecorations(structured?.findings ?? []);
   };
 
-  // First local change to a saved snippet: grab the edit lock (so others see
-  // we're editing and can't take it) and flag the buffer dirty.
+  // "Edit": enter edit mode for a saved snippet. Grab the edit lock (so others
+  // see we're editing and can't take it), unlock the buffer, and focus it.
+  function handleStartEditing() {
+    if (!current || !canEditSnippet || isLockedByOther || isEditing) return;
+    beginEditing();
+    setIsEditing(true);
+    // Focus once Monaco flips out of read-only on the next render.
+    setTimeout(() => editorRef.current?.focus(), 0);
+  }
+
+  // First local change while editing a saved snippet: flag the buffer dirty.
   function markEditing() {
     if (!current || !canEditSnippet || isLockedByOther) return;
-    beginEditing();
     setHasUnsavedEdits(true);
   }
 
@@ -495,6 +528,7 @@ export function Analyzer() {
     }
     saveContent(code, language);
     setHasUnsavedEdits(false);
+    setIsEditing(false);
   }
 
   // ── derived state: identity, permissions and the editor lock ───────────────
@@ -515,8 +549,10 @@ export function Analyzer() {
   const activeOtherEditor =
     editor && editor.userId !== currentUserId ? editor : null;
   const isLockedByOther = !!activeOtherEditor;
-  // Read-only if we lack edit rights, or another person currently has the lock.
-  const isReadOnly = !!current && (!canEditSnippet || isLockedByOther);
+  // Read-only if we lack edit rights, another person holds the lock, or we
+  // haven't clicked "Edit" yet on a saved snippet. (New snippets stay writable.)
+  const isReadOnly =
+    !!current && (!canEditSnippet || isLockedByOther || !isEditing);
   // Most specific reason first: someone editing > view-only access > generic
   // presence message (e.g. "X saved edits").
   const lockMessage = activeOtherEditor
@@ -612,12 +648,20 @@ export function Analyzer() {
           >
             Download PDF
           </button>
-          <button
-            onClick={logout}
-            title="Sign out"
+          <span
+            title={displayNameFromToken(token)}
+            aria-hidden
             className="flex h-8 w-8 items-center justify-center rounded-full bg-blue-600 text-xs font-semibold text-white"
           >
             {initialsFromToken(token)}
+          </span>
+          <button
+            onClick={logout}
+            title="Log out"
+            className="flex items-center gap-1.5 rounded-lg border border-line px-2.5 py-1.5 text-xs font-medium text-fg transition-colors hover:bg-[var(--hover)]"
+          >
+            <Icon path={ICONS.logout} className="h-3.5 w-3.5" />
+            Log out
           </button>
         </div>
       </header>
@@ -746,7 +790,9 @@ export function Analyzer() {
               readOnlyMessage: {
                 value: lockMessage
                   ? lockMessage
-                  : "You only have view access for this snippet.",
+                  : canEditSnippet && !isEditing
+                    ? "Click “Edit” to make changes to this snippet."
+                    : "You only have view access for this snippet.",
               },
             }}
           />
@@ -850,7 +896,8 @@ export function Analyzer() {
             </span>
           </label>
           <span className="hidden items-center gap-1.5 sm:flex">
-            <span className="text-faint">⊕</span> ollama · qwen2.5-coder:7b
+            <span className="text-faint">⊕</span>{" "}
+            {aiInfo ? `${aiInfo.provider} · ${aiInfo.model}` : "…"}
           </span>
           <span className="hidden md:inline">
             {lineCount} lines · {charCount} chars
@@ -868,8 +915,24 @@ export function Analyzer() {
           {error && <span className="text-red-400">{error}</span>}
         </div>
         <div className="flex items-center gap-2">
-          {/* Save edits: shown only to editors; enabled only when dirty and unlocked. */}
-          {current && canEditSnippet && (
+          {/* Edit / Save edits: shown only to editors of a saved snippet.
+              "Edit" unlocks the buffer; once editing, it swaps for "Save edits". */}
+          {current && canEditSnippet && !isEditing && (
+            <button
+              onClick={handleStartEditing}
+              disabled={isLockedByOther}
+              title={
+                isLockedByOther
+                  ? "Someone else is editing"
+                  : "Edit this snippet"
+              }
+              className="flex items-center gap-1.5 rounded-lg border border-line px-3 py-2 text-sm font-medium text-fg transition-colors hover:bg-[var(--hover)] disabled:opacity-45"
+            >
+              <Icon path={ICONS.edit} className="h-3.5 w-3.5" />
+              Edit
+            </button>
+          )}
+          {current && canEditSnippet && isEditing && (
             <button
               onClick={handleSaveEdits}
               disabled={!hasUnsavedEdits || isLockedByOther}

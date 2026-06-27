@@ -95,6 +95,15 @@ export class AiService {
     }
   }
 
+  // The active provider + model, so the UI can show what's actually running
+  // instead of a hardcoded label. Mirrors the dispatch in analyzeCode/chat.
+  describeModel(): { provider: string; model: string } {
+    return {
+      provider: this.provider,
+      model: this.provider === 'gemini' ? this.geminiModel : this.model,
+    };
+  }
+
   // Sends the code to the model and returns a structured analysis serialized
   // as a JSON string (findings + complexity). This is the slow call (tens of
   // seconds on CPU); it runs in the background worker, never on the HTTP path.

@@ -1,5 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
 import { getDataSourceToken } from '@nestjs/typeorm';
+import { AiService } from './analysis/ai.service';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 
@@ -14,6 +15,10 @@ describe('AppController', () => {
         {
           provide: getDataSourceToken(),
           useValue: { query: jest.fn() },
+        },
+        {
+          provide: AiService,
+          useValue: { describeModel: jest.fn() },
         },
       ],
     }).compile();

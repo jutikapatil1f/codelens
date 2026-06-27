@@ -46,6 +46,14 @@ import { AuthModule } from './auth/auth.module';
           redis: {
             host: url.hostname,
             port: Number(url.port) || 6379,
+            // Managed Redis (e.g. Railway) requires auth — carry the
+            // username/password through instead of dropping them.
+            username: url.username || undefined,
+            password: url.password || undefined,
+            // Railway's internal host resolves over IPv6; family: 0 lets
+            // ioredis try both stacks. rediss:// URLs also need TLS enabled.
+            family: 0,
+            ...(url.protocol === 'rediss:' ? { tls: {} } : {}),
           },
         };
       },

@@ -20,6 +20,19 @@ interface OllamaChatResponse {
   message: { role: string; content: string };
 }
 
+// The subset of Gemini's generateContent response we care about. The reply
+// text is split across one or more `parts` under the first candidate.
+interface GeminiResponse {
+  candidates?: { content?: { parts?: { text?: string }[] } }[];
+}
+
+// Gemini's request shape for a single conversational turn. Roles are
+// 'user' | 'model' (note: 'model', not 'assistant').
+interface GeminiContent {
+  role: 'user' | 'model';
+  parts: { text: string }[];
+}
+
 // The structured shape we ask the model to return and persist as the
 // analysis `result` (stored as a JSON string in the text column). The
 // frontend renders each finding as a colored card plus the complexity tiles.
@@ -44,26 +57,42 @@ interface StructuredAnalysis {
 }
 
 /**
- * Wraps the call to the local AI model (Ollama).
+ * Wraps the call to the AI model behind a single, provider-agnostic interface.
  *
  * The processor uses this to turn submitted code into a written review.
  * Isolating the AI call here means the rest of the app doesn't care which
- * provider/model is used — swapping Ollama for Gemini later only touches
- * this file.
+ * provider/model is used. The active provider is chosen by the AI_PROVIDER
+ * env var: 'ollama' (default, for local dev) or 'gemini' (for hosted deploys
+ * where running a 7B model isn't practical). Only this file knows the
+ * difference; the public methods return the same shapes regardless.
  */
 @Injectable()
 export class AiService {
   private readonly logger = new Logger(AiService.name);
+  // Active provider: 'ollama' or 'gemini'.
+  private readonly provider: string;
   // Where Ollama is reachable, e.g. http://localhost:11434.
   private readonly baseUrl: string;
-  // Which model to run, e.g. qwen2.5-coder:7b.
+  // Which Ollama model to run, e.g. qwen2.5-coder:7b.
   private readonly model: string;
+  // Gemini API key (Google AI Studio). Empty unless AI_PROVIDER=gemini.
+  private readonly geminiApiKey: string;
+  // Which Gemini model to call, e.g. gemini-2.5-flash.
+  private readonly geminiModel: string;
 
   constructor(config: ConfigService) {
     // Read connection details from .env (via ConfigService). The second
     // argument to get() is a fallback used when the var isn't set.
+    this.provider = config.get<string>('AI_PROVIDER', 'ollama').toLowerCase();
     this.baseUrl = config.get<string>('OLLAMA_URL', 'http://localhost:11434');
     this.model = config.get<string>('OLLAMA_MODEL', 'qwen2.5-coder:7b');
+    this.geminiApiKey = config.get<string>('GEMINI_API_KEY', '');
+    this.geminiModel = config.get<string>('GEMINI_MODEL', 'gemini-2.5-flash');
+
+    if (this.provider === 'gemini' && !this.geminiApiKey) {
+      // Fail loud in logs rather than at the first (slow) analysis job.
+      this.logger.error('AI_PROVIDER=gemini but GEMINI_API_KEY is not set');
+    }
   }
 
   // Sends the code to the model and returns a structured analysis serialized
@@ -73,9 +102,21 @@ export class AiService {
     // Build the natural-language instructions wrapping the user's code.
     const prompt = this.buildPrompt(code, language);
 
-    // Call Ollama's generate endpoint. stream:false → wait for the full
-    // answer in one response. format:'json' forces the model to emit a single
-    // valid JSON object, which we then validate against our own schema.
+    // Dispatch to the active provider; both return the model's raw text, which
+    // we then validate against our own schema. json:true asks the provider to
+    // emit a single valid JSON object.
+    const raw =
+      this.provider === 'gemini'
+        ? await this.geminiGenerate(prompt)
+        : await this.ollamaGenerate(prompt);
+
+    const structured = this.parseAnalysis(raw);
+    return JSON.stringify(structured);
+  }
+
+  // Ollama's /api/generate: stream:false → wait for the full answer in one
+  // response. format:'json' forces a single valid JSON object.
+  private async ollamaGenerate(prompt: string): Promise<string> {
     const res = await fetch(`${this.baseUrl}/api/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -96,10 +137,18 @@ export class AiService {
       throw new Error(`Ollama request failed (${res.status}): ${body}`);
     }
 
-    // Pull out the generated text and coerce it into our structured shape.
     const data = (await res.json()) as OllamaGenerateResponse;
-    const structured = this.parseAnalysis(data.response);
-    return JSON.stringify(structured);
+    return data.response;
+  }
+
+  // Gemini single-turn generation. responseMimeType:'application/json' is the
+  // Gemini equivalent of Ollama's format:'json'.
+  private async geminiGenerate(prompt: string): Promise<string> {
+    return this.callGemini(
+      [{ role: 'user', parts: [{ text: prompt }] }],
+      undefined,
+      true,
+    );
   }
 
   // Sends a multi-turn conversation to the model and returns the reply text.
@@ -108,6 +157,12 @@ export class AiService {
   // the slow call and must run off the HTTP request path... well, here it runs
   // on the request itself, so the endpoint waits for it.
   async chat(messages: ChatMessage[]): Promise<string> {
+    return this.provider === 'gemini'
+      ? this.geminiChat(messages)
+      : this.ollamaChat(messages);
+  }
+
+  private async ollamaChat(messages: ChatMessage[]): Promise<string> {
     const res = await fetch(`${this.baseUrl}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -126,6 +181,69 @@ export class AiService {
 
     const data = (await res.json()) as OllamaChatResponse;
     return data.message.content.trim();
+  }
+
+  // Maps our ChatMessage[] onto Gemini's shape. Gemini takes the system prompt
+  // separately as `systemInstruction` and uses the role 'model' (not
+  // 'assistant') for the AI's prior turns.
+  private async geminiChat(messages: ChatMessage[]): Promise<string> {
+    const systemInstruction =
+      messages
+        .filter((m) => m.role === 'system')
+        .map((m) => m.content)
+        .join('\n\n') || undefined;
+
+    const contents: GeminiContent[] = messages
+      .filter((m) => m.role !== 'system')
+      .map((m) => ({
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: m.content }],
+      }));
+
+    return this.callGemini(contents, systemInstruction, false);
+  }
+
+  // Single entry point for Gemini's generateContent endpoint. `json` toggles
+  // structured-JSON output (used by analysis, not by free-form chat).
+  private async callGemini(
+    contents: GeminiContent[],
+    systemInstruction: string | undefined,
+    json: boolean,
+  ): Promise<string> {
+    const url =
+      `https://generativelanguage.googleapis.com/v1beta/models/` +
+      `${this.geminiModel}:generateContent?key=${this.geminiApiKey}`;
+
+    const body: Record<string, unknown> = {
+      contents,
+      generationConfig: {
+        // Low temperature → more deterministic, less rambly reviews.
+        temperature: 0.2,
+        ...(json ? { responseMimeType: 'application/json' } : {}),
+      },
+    };
+    if (systemInstruction) {
+      body.systemInstruction = { parts: [{ text: systemInstruction }] };
+    }
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+
+    if (!res.ok) {
+      const errBody = await res.text();
+      throw new Error(`Gemini request failed (${res.status}): ${errBody}`);
+    }
+
+    const data = (await res.json()) as GeminiResponse;
+    // The reply may be split across multiple parts; join them.
+    const text =
+      data.candidates?.[0]?.content?.parts
+        ?.map((p) => p.text ?? '')
+        .join('') ?? '';
+    return text.trim();
   }
 
   // Constructs the prompt: role + the exact JSON contract + the fenced code.

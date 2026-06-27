@@ -8,8 +8,13 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   const port = process.env.PORT ?? 8080;
 
-  // Allow the Next.js frontend (separate origin) to call this API from the browser.
-  app.enableCors();
+  // Allow the Next.js frontend (separate origin) to call this API from the
+  // browser. In production set FRONTEND_URL to the deployed frontend origin to
+  // restrict access; with it unset (local dev) all origins are allowed.
+  const frontendUrl = process.env.FRONTEND_URL;
+  app.enableCors(
+    frontendUrl ? { origin: frontendUrl, credentials: true } : {},
+  );
   // One validation pipe for every route, so each DTO's class-validator rules
   // are enforced consistently before any controller method runs.
   app.useGlobalPipes(
